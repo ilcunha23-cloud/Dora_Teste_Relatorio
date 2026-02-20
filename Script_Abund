@@ -1,0 +1,335 @@
+# ============================================================
+# RELATÓRIO – Paraty (Pequenos mamíferos)
+# 1) Curva do coletor (Mao Tau ± SD) por formação + Geral
+# 2) Índices de biodiversidade (Shannon, Simpson) – Geral + formações
+# 3) Similaridade entre formações (Jaccard P/A; Bray-Curtis abundância)
+# 4) Histograma de abundância relativa por espécie (total),
+#    barras empilhadas segmentadas por formação
+# 5) Salvar tabelas (índices e similaridades) como IMAGENS (PNG)
+#
+# Salva TUDO em:
+# D:/Programas/Mapas_QGIS/Isadora/Relatorio
+# ============================================================
+
+suppressPackageStartupMessages({
+    library(readr)
+    library(dplyr)
+    library(tidyr)
+    library(stringr)
+    library(lubridate)
+    library(vegan)
+    library(ggplot2)
+    library(scales)
+})
+
+# ------------------------------------------------------------
+# 0) Diretório de saída (sem acento = mais robusto no Windows)
+# ------------------------------------------------------------
+output_dir <- "C:/Users/isali/OneDrive/Área de Trabalho/INICIAÇÃO CIENTÍFICA/Relatorio/Teste6"
+if (!dir.exists(output_dir)) dir.create(output_dir, recursive = TRUE)
+
+# ------------------------------------------------------------
+# 1) Ler dados
+# ------------------------------------------------------------
+file_path <- "C:/Users/isali/OneDrive/Área de Trabalho/INICIAÇÃO CIENTÍFICA/Peq Mamíferos de Paraty_Dados Brutos - Pequenos_Dados Brutos"
+dat <- read_csv(file_path, show_col_types = FALSE)
+names(dat) <- str_trim(names(dat))
+stopifnot(all(c("Data", "Espécie") %in% names(dat)))
+
+# ------------------------------------------------------------
+# 2) Detectar coluna de vegetação/formação
+# ------------------------------------------------------------
+possible_veg <- names(dat)[str_detect(str_to_lower(names(dat)),
+                                      "veget|veg|forma|formac|florest|fitof|habitat")]
+if (length(possible_veg) == 0) stop("Não encontrei coluna de vegetação/formação no CSV.")
+veg_col <- possible_veg[1]
+message("Coluna usada como vegetação/formação: ", veg_col)
+
+# ------------------------------------------------------------
+# 3) Limpeza + padronização + excluir Vegetação sem info ("-")
+# ------------------------------------------------------------
+dat2 <- dat %>%
+    mutate(
+        Data    = dmy(str_squish(as.character(Data))),
+        Espécie = str_squish(as.character(`Espécie`)),
+        Veget   = str_squish(as.character(.data[[veg_col]]))
+    ) %>%
+    filter(!is.na(Data), !is.na(Espécie), Espécie != "", !is.na(Veget), Veget != "") %>%
+    mutate(Veget_norm = str_squish(str_to_lower(Veget))) %>%
+    filter(!Veget_norm %in% c("-", "na", "n/a", "sem informação", "sem informacao")) %>%
+    mutate(Formacao = case_when(
+        str_detect(Veget_norm, "agro")  ~ "Agrofloresta",
+        str_detect(Veget_norm, "alter") ~ "Floresta alterada",
+        str_detect(Veget_norm, "madur") ~ "Floresta madura",
+        TRUE ~ NA_character_
+    )) %>%
+    filter(!is.na(Formacao))
+
+# Checagem rápida
+print(table(dat2$Formacao))
+
+# ------------------------------------------------------------
+# 4) Definir os 11 dias de campo (AJUSTE se necessário)
+# ------------------------------------------------------------
+camp1 <- seq.Date(as.Date("2025-11-05"), as.Date("2025-11-10"), by = "day") # 6 dias
+camp2 <- seq.Date(as.Date("2026-02-01"), as.Date("2026-02-05"), by = "day") # 5 dias  => total 11
+sampling_dates <- sort(unique(c(camp1, camp2)))
+
+if (length(sampling_dates) != 11) {
+    stop(paste0("sampling_dates tem ", length(sampling_dates),
+                " dias. Ajuste camp1/camp2 para TOTALIZAR 11 dias."))
+}
+
+# ============================================================
+# PARTE A) CURVA DO COLETOR (Mao Tau ± SD)
+# ============================================================
+
+make_incidence_day <- function(df, all_dates) {
+    df <- df %>% filter(Data %in% all_dates)
+    
+    inc <- df %>%
+        distinct(Data, Espécie) %>%
+        mutate(pres = 1) %>%
+        pivot_wider(names_from = Espécie, values_from = pres, values_fill = 0)
+    
+    base_days <- tibble(Data = all_dates)
+    
+    inc_full <- base_days %>%
+        left_join(inc, by = "Data") %>%
+        arrange(Data)
+    
+    inc_full[is.na(inc_full)] <- 0
+    inc_full %>% select(-Data) %>% as.data.frame()
+}
+
+mao_tau <- function(X, n_perm = 100) {
+    sac <- specaccum(X, method = "random", permutations = n_perm)
+    tibble(
+        dia = seq_along(sac$sites),
+        mao_mean = sac$richness,
+        mao_sd   = sac$sd,
+        mao_low  = pmax(0, sac$richness - sac$sd),   # ±1 SD
+        mao_high = sac$richness + sac$sd
+    )
+}
+
+n_perm <- 100
+groups <- c("Geral", "Agrofloresta", "Floresta alterada", "Floresta madura")
+results <- list()
+
+for (g in groups) {
+    df_g <- if (g == "Geral") dat2 else dat2 %>% filter(Formacao == g)
+    X <- make_incidence_day(df_g, sampling_dates)
+    results[[g]] <- mao_tau(X, n_perm = n_perm) %>% mutate(grupo = g)
+}
+
+curvas <- bind_rows(results)
+
+# Salvar tabela da curva
+write_csv(curvas, file.path(output_dir, "Curvas_MaoTau_SD.csv"))
+
+# --- salvar PNG e PDF da curva (robusto) ---
+out_png_curve <- file.path(output_dir, "Curva_Coletor_MaoTau_SD.png")
+out_pdf_curve <- file.path(output_dir, "Curva_Coletor_MaoTau_SD.pdf")
+
+draw_collector_plot <- function() {
+    cols <- c(
+        "Geral" = "black",
+        "Agrofloresta" = "forestgreen",
+        "Floresta alterada" = "orange3",
+        "Floresta madura" = "blue3"
+    )
+    
+    xmax <- max(curvas$dia, na.rm = TRUE)
+    ymax <- max(curvas$mao_high, na.rm = TRUE)
+    
+    plot(NA, xlim = c(1, xmax), ylim = c(0, ymax),
+         xlab = "Dias acumulados (esforço amostral)",
+         ylab = "Riqueza acumulada (nº de espécies)",
+         main = paste0("Curvas do Coletor (Mao Tau ± SD) – ", n_perm, " randomizações"))
+    
+    for (g in groups) {
+        df <- curvas %>% filter(grupo == g)
+        if (nrow(df) == 0) next
+        
+        polygon(c(df$dia, rev(df$dia)),
+                c(df$mao_low, rev(df$mao_high)),
+                col = adjustcolor(cols[g], alpha.f = 0.20),
+                border = NA)
+        
+        lines(df$dia, df$mao_mean, col = cols[g], lwd = 3)
+    }
+    
+    legend("topleft", legend = groups, col = cols[groups], lwd = 3, bty = "n")
+}
+
+ok <- FALSE
+tryCatch({
+    if (!requireNamespace("ragg", quietly = TRUE)) install.packages("ragg")
+    ragg::agg_png(filename = out_png_curve, width = 2400, height = 1800, res = 300)
+    draw_collector_plot()
+    dev.off()
+    ok <- TRUE
+}, error = function(e) message("Falhou com ragg::agg_png(): ", conditionMessage(e)))
+
+if (!ok) {
+    png(filename = out_png_curve, width = 2400, height = 1800, res = 300, type = "cairo")
+    draw_collector_plot()
+    dev.off()
+}
+
+pdf(out_pdf_curve, width = 10, height = 7)
+draw_collector_plot()
+dev.off()
+
+# ============================================================
+# PARTE B) ÍNDICES DE BIODIVERSIDADE (Shannon, Simpson)
+# ============================================================
+
+abund_form <- dat2 %>%
+    count(Formacao, Espécie, name = "n") %>%
+    pivot_wider(names_from = Espécie, values_from = n, values_fill = 0) %>%
+    arrange(Formacao)
+
+abund_geral <- dat2 %>%
+    count(Espécie, name = "n") %>%
+    pivot_wider(names_from = Espécie, values_from = n, values_fill = 0)
+
+div_metrics <- function(mat) {
+    tibble(
+        Shannon = diversity(mat, index = "shannon"),
+        Simpson = diversity(mat, index = "simpson")  # vegan = 1 - D
+    )
+}
+
+div_form <- div_metrics(abund_form %>% select(-Formacao)) %>%
+    mutate(Grupo = abund_form$Formacao) %>%
+    select(Grupo, Shannon, Simpson)
+
+div_geral <- div_metrics(abund_geral) %>%
+    mutate(Grupo = "Geral") %>%
+    select(Grupo, Shannon, Simpson)
+
+div_all <- bind_rows(div_geral, div_form)
+
+write_csv(div_all, file.path(output_dir, "Indices_Biodiversidade_Shannon_Simpson.csv"))
+
+# ============================================================
+# PARTE C) SIMILARIDADE ENTRE FORMAÇÕES
+# ============================================================
+
+pa_form <- abund_form
+pa_form[, -1] <- (pa_form[, -1] > 0) * 1
+
+dist_jacc <- vegdist(pa_form %>% select(-Formacao), method = "jaccard", binary = TRUE)
+sim_jacc  <- 1 - as.matrix(dist_jacc)
+rownames(sim_jacc) <- pa_form$Formacao
+colnames(sim_jacc) <- pa_form$Formacao
+
+dist_bray <- vegdist(abund_form %>% select(-Formacao), method = "bray")
+sim_bray  <- 1 - as.matrix(dist_bray)
+rownames(sim_bray) <- abund_form$Formacao
+colnames(sim_bray) <- abund_form$Formacao
+
+write.csv(round(sim_jacc, 6), file.path(output_dir, "Similaridade_Jaccard.csv"))
+write.csv(round(sim_bray, 6), file.path(output_dir, "Similaridade_BrayCurtis.csv"))
+
+# ============================================================
+# PARTE D) HISTOGRAMA – ABUNDÂNCIA RELATIVA (TOTAL) POR ESPÉCIE
+# ============================================================
+
+abund_sf <- dat2 %>% count(Espécie, Formacao, name = "n")
+
+tot_species <- abund_sf %>%
+    group_by(Espécie) %>%
+    summarise(n_total = sum(n), .groups = "drop") %>%
+    arrange(desc(n_total))
+
+grand_total <- sum(tot_species$n_total)
+stopifnot(grand_total > 0)
+
+plot_df <- abund_sf %>%
+    left_join(tot_species, by = "Espécie") %>%
+    mutate(
+        rel_segment = n / grand_total,
+        Espécie = factor(Espécie, levels = tot_species$Espécie),
+        Formacao = factor(Formacao, levels = c("Agrofloresta", "Floresta alterada", "Floresta madura"))
+    )
+
+write_csv(plot_df, file.path(output_dir, "Abundancia_Relativa_por_Especie_segmentada_por_Formacao.csv"))
+
+p_hist <- ggplot(plot_df, aes(x = Espécie, y = rel_segment, fill = Formacao)) +
+    geom_col(width = 0.85) +
+    scale_y_continuous(labels = percent_format(accuracy = 0.1)) +
+    labs(
+        title = "Abundância relativa geral e por fitofisionomia",
+        x = "Espécies",
+        y = "Abundância relativa",
+        fill = "Fitofisionomia"
+    ) +
+    theme_bw() +
+    theme(
+        axis.text.x = element_text(angle = 60, hjust = 1, vjust = 1),
+        plot.title = element_text(hjust = 0.5)
+    )
+
+ggsave(file.path(output_dir, "Histograma_Abundancia_Relativa_Especies.png"),
+       plot = p_hist, width = 14, height = 8, dpi = 300)
+
+ggsave(file.path(output_dir, "Histograma_Abundancia_Relativa_Especies.pdf"),
+       plot = p_hist, width = 14, height = 8)
+
+# ============================================================
+# PARTE E) SALVAR TABELAS (ÍNDICES E SIMILARIDADES) COMO IMAGENS
+# ============================================================
+
+if (!requireNamespace("gridExtra", quietly = TRUE)) install.packages("gridExtra")
+if (!requireNamespace("grid", quietly = TRUE)) install.packages("grid")
+library(gridExtra)
+library(grid)
+
+# E1) Índices de biodiversidade -> PNG
+div_img <- div_all %>%
+    mutate(
+        Shannon = round(Shannon, 4),
+        Simpson = round(Simpson, 4)
+    )
+
+png(filename = file.path(output_dir, "Tabela_Indices_Biodiversidade.png"),
+    width = 1800, height = 900, res = 300)
+grid.newpage()
+grid.table(div_img)
+dev.off()
+
+# E2) Similaridade Jaccard -> PNG
+sim_jacc_df <- as.data.frame(round(sim_jacc, 4))
+sim_jacc_df <- cbind(Formacao = rownames(sim_jacc_df), sim_jacc_df)
+
+png(filename = file.path(output_dir, "Tabela_Similaridade_Jaccard.png"),
+    width = 2000, height = 1200, res = 300)
+grid.newpage()
+grid.table(sim_jacc_df)
+dev.off()
+
+# E3) Similaridade Bray-Curtis -> PNG
+sim_bray_df <- as.data.frame(round(sim_bray, 4))
+sim_bray_df <- cbind(Formacao = rownames(sim_bray_df), sim_bray_df)
+
+png(filename = file.path(output_dir, "Tabela_Similaridade_BrayCurtis.png"),
+    width = 2000, height = 1200, res = 300)
+grid.newpage()
+grid.table(sim_bray_df)
+dev.off()
+
+# ------------------------------------------------------------
+# Final
+# ------------------------------------------------------------
+message("✅ Tudo salvo em: ", output_dir)
+message("✅ Curva PNG: ", out_png_curve)
+message("✅ Histograma PNG: ", file.path(output_dir, "Histograma_Abundancia_Relativa_Especies.png"))
+message("✅ Índices (CSV + PNG): ", file.path(output_dir, "Indices_Biodiversidade_Shannon_Simpson.csv"),
+        " | ", file.path(output_dir, "Tabela_Indices_Biodiversidade.png"))
+message("✅ Similaridades (CSV + PNG): ",
+        file.path(output_dir, "Similaridade_Jaccard.csv"), " | ", file.path(output_dir, "Tabela_Similaridade_Jaccard.png"),
+        " || ",
+        file.path(output_dir, "Similaridade_BrayCurtis.csv"), " | ", file.path(output_dir, "Tabela_Similaridade_BrayCurtis.png"))
