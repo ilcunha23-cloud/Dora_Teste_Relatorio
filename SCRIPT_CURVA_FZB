@@ -31,8 +31,7 @@ suppressPackageStartupMessages({
 # -------------------------------
 # 1) Caminhos
 # -------------------------------
-# Opção A: escolha o arquivo manualmente quando o R pedir:
-file_path <- file.choose()
+
 
 # Opção B: se preferir, comente a linha acima e informe o caminho direto:
 # file_path <- "C:/Users/isali/OneDrive/Área de Trabalho/INICIAÇÃO CIENTÍFICA/Peq Mamíferos de Paraty_Dados Brutos - Pequenos_Dados Brutos.csv"
